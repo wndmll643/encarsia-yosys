@@ -474,6 +474,12 @@ static void add_zero_outputs(RTLIL::Module *module, const HierCovParams &params)
 	io_covhash->port_output = true;
 	module->connect(io_covsum, RTLIL::Const(0, params.covSumSize));
 	module->connect(io_covhash, RTLIL::Const(0, params.submodHashSize));
+	// Add io_covSum for DifuzzRTL receptor compatibility
+	if (!module->wire(RTLIL::escape_id("io_covSum"))) {
+		RTLIL::Wire *io_drtl_covsum = module->addWire(RTLIL::escape_id("io_covSum"), 30);
+		io_drtl_covsum->port_output = true;
+		module->connect(io_drtl_covsum, RTLIL::Const(0, 30));
+	}
 	module->fixup_ports();
 }
 
@@ -615,6 +621,13 @@ static void hierfuzz_coverage_module(
 	io_covsum->port_output = true;
 	RTLIL::Wire *io_covhash = module->addWire(RTLIL::escape_id("io_hierCovHash"), params.submodHashSize);
 	io_covhash->port_output = true;
+
+	// Add io_covSum (30-bit, zero) for compatibility with DifuzzRTL receptors
+	if (!module->wire(RTLIL::escape_id("io_covSum"))) {
+		RTLIL::Wire *io_drtl_covsum = module->addWire(RTLIL::escape_id("io_covSum"), 30);
+		io_drtl_covsum->port_output = true;
+		module->connect(io_drtl_covsum, RTLIL::Const(0, 30));
+	}
 
 	// Aggregate child covSums: io_hierCovSum = local + sum(children)
 	RTLIL::SigSpec current_sum(cov_sum);
@@ -841,5 +854,316 @@ struct HierFuzzInstrumentV6bPass : public Pass {
 			hierfuzz_reset_module(design, module, "hierfuzz_v6b_reset");
 	}
 } HierFuzzInstrumentV6bPass;
+
+// ---------------------------------------------------------------------------
+// V7 parameters — dynamic hash sizing, extmodule proxy, raised caps
+// ---------------------------------------------------------------------------
+struct HierCovV7Params {
+	int maxInputHashSize = 10;
+	int maxCoreHashSize  = 12;
+	int minHashSize      = 4;
+	int submodHashSize   = 6;
+	int covSumSize       = 32;
+	int maxInputPorts    = 8;
+	int maxBitsPerPort   = 8;
+	int maxRegBits       = 256;
+	int maxCtrlRegWidth  = 20;
+	int bucketCount      = 16;
+	int bucketWidth      = 8;
+	int maxBucketSigBits = 128;
+	int maxExtModPorts   = 16;
+	int maxExtModBitsPerPort = 8;
+};
+
+// Dynamic hash width: for small bit counts use numBits directly,
+// for large use log2(numBits), clamped to [minSize, maxSize].
+static int dynamic_hash_width(int numBits, int minSize, int maxSize)
+{
+	if (numBits <= 0) return 0;
+	if (numBits <= maxSize) return numBits;
+	int w = log2ceil(numBits);
+	if (w < minSize) w = minSize;
+	if (w > maxSize) w = maxSize;
+	return w;
+}
+
+// Helper: build a HierCovParams from a HierCovV7Params (C++11 compatible)
+static HierCovParams v7_to_v6_params(const HierCovV7Params &v7)
+{
+	HierCovParams p;
+	p.maxInputHashSize = v7.maxInputHashSize;
+	p.maxCoreHashSize  = v7.maxCoreHashSize;
+	p.submodHashSize   = v7.submodHashSize;
+	p.covSumSize       = v7.covSumSize;
+	p.maxInputPorts    = v7.maxInputPorts;
+	p.maxBitsPerPort   = v7.maxBitsPerPort;
+	p.maxRegBits       = v7.maxRegBits;
+	p.maxCtrlRegWidth  = v7.maxCtrlRegWidth;
+	p.bucketCount      = v7.bucketCount;
+	p.bucketWidth      = v7.bucketWidth;
+	p.maxBucketSigBits = v7.maxBucketSigBits;
+	return p;
+}
+
+// Check if a module is a blackbox/extmodule (has attribute or has no cells)
+static bool is_extmodule(RTLIL::Module *mod)
+{
+	if (mod->get_blackbox_attribute())
+		return true;
+	// Also treat empty modules (no cells at all) as extmodules
+	for (auto cell : mod->cells()) {
+		(void)cell;
+		return false;  // has at least one cell
+	}
+	return true;  // no cells
+}
+
+// Collect proxy coverage bits from extmodule instances (input ports only)
+static std::vector<NamedBit> collect_extmodule_proxy_bits(
+	RTLIL::Design *design,
+	RTLIL::Module *module,
+	const HierCovV7Params &params)
+{
+	std::vector<NamedBit> result;
+	for (auto cell : module->cells()) {
+		if (!cell->type.isPublic()) continue;
+		RTLIL::Module *submod = design->module(cell->type);
+		if (!submod) continue;
+		if (!is_extmodule(submod))
+			continue;
+
+		std::string cell_name = strip_id(cell->name.str());
+		int port_count = 0;
+		for (auto &port_name : submod->ports) {
+			RTLIL::Wire *pw = submod->wire(port_name);
+			if (!pw || !pw->port_input) continue;
+			if (port_count >= params.maxExtModPorts) break;
+			port_count++;
+
+			// Get the signal connected to this port on the instance
+			RTLIL::SigSpec sig = cell->getPort(port_name);
+			int width = sig.size();
+			int bitsToTake = std::min(params.maxExtModBitsPerPort, width);
+			int stride = std::max(1, width / bitsToTake);
+			int count = 0;
+			for (int i = 0; i < width && count < bitsToTake; i += stride, count++) {
+				NamedBit nb;
+				nb.bit = sig[i];
+				nb.name = cell_name + "." + strip_id(port_name.str()) + "[" + std::to_string(i) + "]";
+				result.push_back(nb);
+			}
+		}
+	}
+	return result;
+}
+
+// ---------------------------------------------------------------------------
+// V7 coverage instrumentation (per module, recursive)
+// ---------------------------------------------------------------------------
+static void hierfuzz_coverage_module_v7(
+	RTLIL::Design *design,
+	RTLIL::Module *module,
+	const HierCovV7Params &params,
+	const char *attr_name)
+{
+	if (module->has_attribute(RTLIL::escape_id(attr_name))) return;
+
+	RTLIL::SigSpec clock;
+	bool has_clock = find_clock(module, clock);
+
+	ModuleAnalysis analysis = analyze_module(module);
+
+	// Convert v7 params to v6 for reuse of select_input_bits / select_control_reg_bits
+	HierCovParams compat = v7_to_v6_params(params);
+
+	// V7 uses data inputs (like v6a)
+	auto inputBits = select_input_bits(module, analysis.ctrlPortNames, compat, DATA_INPUTS);
+
+	// V7: select control register bits with raised maxRegBits
+	auto regBits = select_control_reg_bits(analysis.ctrlFFs, analysis.dirInFFs, compat);
+
+	// Recurse into children and collect io_hierCovHash
+	std::vector<RTLIL::Cell *> submod_cells;
+	for (auto cell : module->selected_cells())
+		if (cell->type.isPublic())
+			submod_cells.push_back(cell);
+
+	std::vector<NamedBit> submodBits;
+	for (auto cell : submod_cells) {
+		RTLIL::Module *submod = design->module(cell->type);
+		if (!submod) continue;
+
+		hierfuzz_coverage_module_v7(design, submod, params, attr_name);
+
+		RTLIL::IdString hash_port = RTLIL::escape_id("io_hierCovHash");
+		if (std::find(submod->ports.begin(), submod->ports.end(), hash_port) == submod->ports.end())
+			continue;
+
+		RTLIL::Wire *child_hash = module->addWire(NEW_ID, params.submodHashSize);
+		cell->setPort(hash_port, child_hash);
+
+		std::string cell_name = strip_id(cell->name.str());
+		for (int i = 0; i < params.submodHashSize; i++) {
+			std::string name = cell_name + ".io_hierCovHash[" + std::to_string(i) + "]";
+			submodBits.push_back({RTLIL::SigBit(child_hash, i), name});
+		}
+	}
+
+	// V7: collect extmodule proxy bits
+	auto extBits = collect_extmodule_proxy_bits(design, module, params);
+
+	// Merge regBits + submodBits + extBits into coreBits
+	std::vector<NamedBit> coreBits;
+	coreBits.insert(coreBits.end(), regBits.begin(), regBits.end());
+	coreBits.insert(coreBits.end(), submodBits.begin(), submodBits.end());
+	coreBits.insert(coreBits.end(), extBits.begin(), extBits.end());
+
+	// V7: dynamic hash sizes based on actual bit counts
+	int dynInputHash = dynamic_hash_width((int)inputBits.size(), params.minHashSize, params.maxInputHashSize);
+	int dynCoreHash  = dynamic_hash_width((int)coreBits.size(), params.minHashSize, params.maxCoreHashSize);
+	if (inputBits.empty()) dynInputHash = 0;
+	if (coreBits.empty()) dynCoreHash = 0;
+	int addrWidth = dynInputHash + dynCoreHash;
+
+	if (!has_clock || addrWidth == 0) {
+		add_zero_outputs(module, compat);
+		module->set_bool_attribute(RTLIL::escape_id(attr_name));
+		log("HierFuzz v7 coverage: %s (no clock or no coverage bits, zero outputs)\n", module->name.c_str());
+		return;
+	}
+
+	// Build hashes
+	RTLIL::SigSpec inputHash = build_hash(module, inputBits, dynInputHash);
+	RTLIL::SigSpec coreHash  = build_hash(module, coreBits, dynCoreHash);
+
+	// Address = Cat(inputHash, coreHash) — inputHash is MSB
+	RTLIL::SigSpec addr;
+	if (dynCoreHash > 0) addr.append(coreHash);
+	if (dynInputHash > 0) addr.append(inputHash);
+
+	// Coverage map
+	RTLIL::Wire *is_covered_wire = module->addWire(NEW_ID, 1);
+	RTLIL::SigSpec is_covered(is_covered_wire);
+	create_coverage_map(module, clock, addr, addrWidth, is_covered);
+
+	// newHit = !is_covered
+	RTLIL::Wire *new_hit_wire = module->addWire(NEW_ID, 1);
+	module->addNot(NEW_ID, is_covered, new_hit_wire);
+
+	// covSum register
+	RTLIL::Wire *cov_sum = module->addWire(NEW_ID, params.covSumSize);
+	RTLIL::Wire *next_sum = module->addWire(NEW_ID, params.covSumSize);
+	RTLIL::Wire *inc_sum = module->addWire(NEW_ID, params.covSumSize);
+	module->addDff(NEW_ID, clock, next_sum, cov_sum);
+	module->addAdd(NEW_ID, cov_sum, RTLIL::Const(1, params.covSumSize), inc_sum);
+	module->addMux(NEW_ID, inc_sum, cov_sum, is_covered, next_sum);
+
+	// Bucket registers
+	int bucketIdxWidth = log2ceil(params.bucketCount);
+	RTLIL::SigSpec bucketIdx = xor_fold_addr(module, addr, addrWidth, bucketIdxWidth);
+
+	std::vector<RTLIL::Wire *> bucket_q(params.bucketCount);
+	for (int i = 0; i < params.bucketCount; i++) {
+		RTLIL::Wire *q    = module->addWire(NEW_ID, params.bucketWidth);
+		RTLIL::Wire *next = module->addWire(NEW_ID, params.bucketWidth);
+		RTLIL::Wire *inc  = module->addWire(NEW_ID, params.bucketWidth);
+		RTLIL::Wire *is_b = module->addWire(NEW_ID, 1);
+		RTLIL::Wire *mux_inner = module->addWire(NEW_ID, params.bucketWidth);
+
+		module->addDff(NEW_ID, clock, next, q);
+		module->addAdd(NEW_ID, q, RTLIL::Const(1, params.bucketWidth), inc);
+		module->addEq(NEW_ID, bucketIdx, RTLIL::Const(i, bucketIdxWidth), is_b);
+		module->addMux(NEW_ID, q, inc, is_b, mux_inner);
+		module->addMux(NEW_ID, q, mux_inner, new_hit_wire, next);
+
+		bucket_q[i] = q;
+	}
+
+	// Build covHash from bucket bits
+	std::vector<NamedBit> bucketBits;
+	std::string mod_name = strip_id(module->name.str());
+	for (int i = 0; i < params.bucketCount; i++) {
+		int w = params.bucketWidth;
+		int stride = std::max(1, w / std::min(w, 8));
+		for (int idx = 0; idx < w && (int)bucketBits.size() < params.maxBucketSigBits; idx += stride) {
+			std::string name = mod_name + "_covBucket_" + std::to_string(i) + "[" + std::to_string(idx) + "]";
+			bucketBits.push_back({RTLIL::SigBit(bucket_q[i], idx), name});
+		}
+	}
+	RTLIL::SigSpec covHash = build_hash(module, bucketBits, params.submodHashSize);
+
+	// Output ports
+	RTLIL::Wire *io_covsum = module->addWire(RTLIL::escape_id("io_hierCovSum"), params.covSumSize);
+	io_covsum->port_output = true;
+	RTLIL::Wire *io_covhash = module->addWire(RTLIL::escape_id("io_hierCovHash"), params.submodHashSize);
+	io_covhash->port_output = true;
+
+	// io_covSum dummy for DifuzzRTL receptor compatibility
+	if (!module->wire(RTLIL::escape_id("io_covSum"))) {
+		RTLIL::Wire *io_drtl_covsum = module->addWire(RTLIL::escape_id("io_covSum"), 30);
+		io_drtl_covsum->port_output = true;
+		module->connect(io_drtl_covsum, RTLIL::Const(0, 30));
+	}
+
+	// Aggregate child covSums
+	RTLIL::SigSpec current_sum(cov_sum);
+	for (auto cell : submod_cells) {
+		RTLIL::Module *submod = design->module(cell->type);
+		if (!submod) continue;
+		RTLIL::IdString sum_port = RTLIL::escape_id("io_hierCovSum");
+		if (std::find(submod->ports.begin(), submod->ports.end(), sum_port) == submod->ports.end())
+			continue;
+
+		RTLIL::Wire *child_sum = module->addWire(NEW_ID, params.covSumSize);
+		cell->setPort(sum_port, child_sum);
+		RTLIL::Wire *new_sum = module->addWire(NEW_ID, params.covSumSize);
+		module->addAdd(NEW_ID, current_sum, RTLIL::SigSpec(child_sum), new_sum);
+		current_sum = RTLIL::SigSpec(new_sum);
+	}
+	module->connect(io_covsum, current_sum);
+	module->connect(io_covhash, covHash);
+
+	module->fixup_ports();
+	module->set_bool_attribute(RTLIL::escape_id(attr_name));
+	log("HierFuzz v7 coverage: %s (inputHash=%d, coreHash=%d, addrWidth=%d, ctrlFFs=%d, extBits=%d)\n",
+	    module->name.c_str(), dynInputHash, dynCoreHash, addrWidth,
+	    (int)analysis.ctrlFFs.size(), (int)extBits.size());
+}
+
+// ---------------------------------------------------------------------------
+// V7 pass registration
+// ---------------------------------------------------------------------------
+struct HierFuzzInstrumentV7Pass : public Pass {
+	HierFuzzInstrumentV7Pass() : Pass("hierfuzz_instrument_v7",
+		"instrument with hierCov v7 (dynamic hash, extmod proxy, raised caps)") { }
+	void help() override
+	{
+		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
+		log("\n");
+		log("    hierfuzz_instrument_v7\n");
+		log("\n");
+		log("Instrument the design with hierarchical coverage (v7).\n");
+		log("Compared to v6a: dynamic hash sizing (log2-based, clamped [4,12]),\n");
+		log("raised maxRegBits (256), extmodule proxy coverage via input ports,\n");
+		log("and higher maxInputHashSize (10) / maxCoreHashSize (12).\n");
+		log("\n");
+	}
+	void execute(std::vector<std::string>, RTLIL::Design *design) override
+	{
+		HierCovV7Params params;
+		log("Executing HierFuzz v7 instrumentation.\n");
+
+		std::vector<RTLIL::Module *> modules;
+		for (auto module : design->selected_modules())
+			modules.push_back(module);
+
+		for (auto module : modules)
+			hierfuzz_coverage_module_v7(design, module, params, "hierfuzz_v7_cov");
+		for (auto module : modules)
+			hierfuzz_assert_module(design, module, "hierfuzz_v7_assert");
+		for (auto module : modules)
+			hierfuzz_reset_module(design, module, "hierfuzz_v7_reset");
+	}
+} HierFuzzInstrumentV7Pass;
 
 PRIVATE_NAMESPACE_END
