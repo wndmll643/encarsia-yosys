@@ -466,7 +466,8 @@ static void create_coverage_map(
 // ---------------------------------------------------------------------------
 // Add zero-valued output ports (for modules without clock or coverage bits)
 // ---------------------------------------------------------------------------
-static void add_zero_outputs(RTLIL::Module *module, const HierCovParams &params)
+static void add_zero_outputs(RTLIL::Module *module, const HierCovParams &params,
+                              bool emitSumTotal = false, bool useOwnHashChain = false)
 {
 	RTLIL::Wire *io_covsum = module->addWire(RTLIL::escape_id("io_hierCovSum"), params.covSumSize);
 	io_covsum->port_output = true;
@@ -480,6 +481,17 @@ static void add_zero_outputs(RTLIL::Module *module, const HierCovParams &params)
 		io_drtl_covsum->port_output = true;
 		module->connect(io_drtl_covsum, RTLIL::Const(0, 30));
 	}
+	// v11 / v12 opt-in extra ports, zero-driven on this no-clock / no-coverage path.
+	if (emitSumTotal) {
+		RTLIL::Wire *io_sumtot = module->addWire(RTLIL::escape_id("io_hierCovSumTotal"), params.covSumSize);
+		io_sumtot->port_output = true;
+		module->connect(io_sumtot, RTLIL::Const(0, params.covSumSize));
+	}
+	if (useOwnHashChain) {
+		RTLIL::Wire *io_hashown = module->addWire(RTLIL::escape_id("io_hierCovHashOwn"), params.submodHashSize);
+		io_hashown->port_output = true;
+		module->connect(io_hashown, RTLIL::Const(0, params.submodHashSize));
+	}
 	module->fixup_ports();
 }
 
@@ -491,7 +503,15 @@ static void hierfuzz_coverage_module(
 	RTLIL::Module *module,
 	const HierCovParams &params,
 	InputMode mode,
-	const char *attr_name)
+	const char *attr_name,
+	// v11 opt-in: alias io_hierCovSum as a new port io_hierCovSumTotal so
+	// HierRTLhostTotal (HIER_COV_TOTAL=1) routes on it.
+	// v12 opt-in: emit io_hierCovHashOwn (hash of own state only) and have
+	// parents collect submodBits from io_hierCovHashOwn instead of
+	// io_hierCovHash. Defaults false — v6a/v6b callers emit byte-identical
+	// Verilog.
+	bool emitSumTotal = false,
+	bool useOwnHashChain = false)
 {
 	if (module->has_attribute(RTLIL::escape_id(attr_name))) return;
 
@@ -513,16 +533,20 @@ static void hierfuzz_coverage_module(
 		if (cell->type.isPublic())
 			submod_cells.push_back(cell);
 
+	// v12: read child's io_hierCovHashOwn instead of io_hierCovHash.
+	const char *child_hash_port_name = useOwnHashChain ? "io_hierCovHashOwn" : "io_hierCovHash";
+
 	std::vector<NamedBit> submodBits;
 	for (auto cell : submod_cells) {
 		RTLIL::Module *submod = design->module(cell->type);
 		if (!submod) continue;
 
 		// Recurse into submodule
-		hierfuzz_coverage_module(design, submod, params, mode, attr_name);
+		hierfuzz_coverage_module(design, submod, params, mode, attr_name,
+			emitSumTotal, useOwnHashChain);
 
-		// Check if submodule now has io_hierCovHash
-		RTLIL::IdString hash_port = RTLIL::escape_id("io_hierCovHash");
+		// Check if submodule now has the chosen child-hash port
+		RTLIL::IdString hash_port = RTLIL::escape_id(child_hash_port_name);
 		if (std::find(submod->ports.begin(), submod->ports.end(), hash_port) == submod->ports.end())
 			continue;
 
@@ -531,7 +555,7 @@ static void hierfuzz_coverage_module(
 
 		std::string cell_name = strip_id(cell->name.str());
 		for (int i = 0; i < params.submodHashSize; i++) {
-			std::string name = cell_name + ".io_hierCovHash[" + std::to_string(i) + "]";
+			std::string name = cell_name + "." + child_hash_port_name + "[" + std::to_string(i) + "]";
 			submodBits.push_back({RTLIL::SigBit(child_hash, i), name});
 		}
 	}
@@ -547,7 +571,7 @@ static void hierfuzz_coverage_module(
 	int addrWidth = dynInputHash + dynCoreHash;
 
 	if (!has_clock || addrWidth == 0) {
-		add_zero_outputs(module, params);
+		add_zero_outputs(module, params, emitSumTotal, useOwnHashChain);
 		module->set_bool_attribute(RTLIL::escape_id(attr_name));
 		log("HierFuzz coverage: %s (no clock or no coverage bits, zero outputs)\n", module->name.c_str());
 		return;
@@ -646,6 +670,28 @@ static void hierfuzz_coverage_module(
 	}
 	module->connect(io_covsum, current_sum);
 	module->connect(io_covhash, covHash);
+
+	// v11 opt-in: io_hierCovSumTotal aliases the tree-summed io_hierCovSum.
+	if (emitSumTotal) {
+		RTLIL::Wire *io_sumtot = module->addWire(RTLIL::escape_id("io_hierCovSumTotal"), params.covSumSize);
+		io_sumtot->port_output = true;
+		module->connect(io_sumtot, current_sum);
+	}
+
+	// v12 opt-in: io_hierCovHashOwn = build_hash(inputBits ++ regBits, submodHashSize).
+	if (useOwnHashChain) {
+		std::vector<NamedBit> ownBits;
+		ownBits.insert(ownBits.end(), inputBits.begin(), inputBits.end());
+		ownBits.insert(ownBits.end(), regBits.begin(), regBits.end());
+		RTLIL::Wire *io_hashown = module->addWire(RTLIL::escape_id("io_hierCovHashOwn"), params.submodHashSize);
+		io_hashown->port_output = true;
+		if (ownBits.empty()) {
+			module->connect(io_hashown, RTLIL::Const(0, params.submodHashSize));
+		} else {
+			RTLIL::SigSpec ownHash = build_hash(module, ownBits, params.submodHashSize);
+			module->connect(io_hashown, ownHash);
+		}
+	}
 
 	module->fixup_ports();
 	module->set_bool_attribute(RTLIL::escape_id(attr_name));
@@ -1988,7 +2034,8 @@ struct HierCovV9dParams {
 // ---------------------------------------------------------------------------
 // V9 add_zero_outputs with configurable submodHashSize
 // ---------------------------------------------------------------------------
-static void add_zero_outputs_v9(RTLIL::Module *module, int covSumSize, int submodHashSize)
+static void add_zero_outputs_v9(RTLIL::Module *module, int covSumSize, int submodHashSize,
+                                 bool emitSumTotal = false, bool useOwnHashChain = false)
 {
 	RTLIL::Wire *io_covsum = module->addWire(RTLIL::escape_id("io_hierCovSum"), covSumSize);
 	io_covsum->port_output = true;
@@ -2000,6 +2047,17 @@ static void add_zero_outputs_v9(RTLIL::Module *module, int covSumSize, int submo
 		RTLIL::Wire *io_drtl_covsum = module->addWire(RTLIL::escape_id("io_covSum"), 30);
 		io_drtl_covsum->port_output = true;
 		module->connect(io_drtl_covsum, RTLIL::Const(0, 30));
+	}
+	// v11 / v12 opt-in extra ports, zero-driven on this no-clock / no-coverage path.
+	if (emitSumTotal) {
+		RTLIL::Wire *io_sumtot = module->addWire(RTLIL::escape_id("io_hierCovSumTotal"), covSumSize);
+		io_sumtot->port_output = true;
+		module->connect(io_sumtot, RTLIL::Const(0, covSumSize));
+	}
+	if (useOwnHashChain) {
+		RTLIL::Wire *io_hashown = module->addWire(RTLIL::escape_id("io_hierCovHashOwn"), submodHashSize);
+		io_hashown->port_output = true;
+		module->connect(io_hashown, RTLIL::Const(0, submodHashSize));
 	}
 	module->fixup_ports();
 }
@@ -2027,7 +2085,15 @@ static void hierfuzz_coverage_module_v9_v6b(
 	int maxBucketSigBits,
 	HashBuilder hashFn,
 	const char *attr_name,
-	const char *version_tag)
+	const char *version_tag,
+	// v11 opt-in: emit io_hierCovSumTotal output port aliased to the existing
+	// tree-summed io_hierCovSum value, so HierRTLhostTotal can route on it.
+	// v12 opt-in: also emit io_hierCovHashOwn = hash(own_inputs ++ own_regs),
+	// and have parents collect submodBits from io_hierCovHashOwn instead of
+	// io_hierCovHash. Defaults are false so existing v9a/v9c callers emit
+	// byte-identical Verilog.
+	bool emitSumTotal = false,
+	bool useOwnHashChain = false)
 {
 	if (module->has_attribute(RTLIL::escape_id(attr_name))) return;
 
@@ -2059,6 +2125,11 @@ static void hierfuzz_coverage_module_v9_v6b(
 		if (cell->type.isPublic())
 			submod_cells.push_back(cell);
 
+	// v12: parents read children's io_hierCovHashOwn (hash of own state only)
+	// instead of io_hierCovHash (bucket-histogram fingerprint of activity history),
+	// breaking the transitive descendant-activity leak.
+	const char *child_hash_port_name = useOwnHashChain ? "io_hierCovHashOwn" : "io_hierCovHash";
+
 	std::vector<NamedBit> submodBits;
 	for (auto cell : submod_cells) {
 		RTLIL::Module *submod = design->module(cell->type);
@@ -2067,9 +2138,10 @@ static void hierfuzz_coverage_module_v9_v6b(
 		hierfuzz_coverage_module_v9_v6b(design, submod,
 			maxInputHashSize, maxCoreHashSize, maxAddrWidth, submodHashSize,
 			covSumSize, maxInputPorts, maxBitsPerPort, maxRegBits, maxCtrlRegWidth,
-			bucketCount, bucketWidth, maxBucketSigBits, hashFn, attr_name, version_tag);
+			bucketCount, bucketWidth, maxBucketSigBits, hashFn, attr_name, version_tag,
+			emitSumTotal, useOwnHashChain);
 
-		RTLIL::IdString hash_port = RTLIL::escape_id("io_hierCovHash");
+		RTLIL::IdString hash_port = RTLIL::escape_id(child_hash_port_name);
 		if (std::find(submod->ports.begin(), submod->ports.end(), hash_port) == submod->ports.end())
 			continue;
 
@@ -2078,7 +2150,7 @@ static void hierfuzz_coverage_module_v9_v6b(
 
 		std::string cell_name = strip_id(cell->name.str());
 		for (int i = 0; i < submodHashSize; i++) {
-			std::string name = cell_name + ".io_hierCovHash[" + std::to_string(i) + "]";
+			std::string name = cell_name + "." + child_hash_port_name + "[" + std::to_string(i) + "]";
 			submodBits.push_back({RTLIL::SigBit(child_hash, i), name});
 		}
 	}
@@ -2102,7 +2174,7 @@ static void hierfuzz_coverage_module_v9_v6b(
 	int addrWidth = dynInputHash + dynCoreHash;
 
 	if (!has_clock || addrWidth == 0) {
-		add_zero_outputs_v9(module, covSumSize, submodHashSize);
+		add_zero_outputs_v9(module, covSumSize, submodHashSize, emitSumTotal, useOwnHashChain);
 		module->set_bool_attribute(RTLIL::escape_id(attr_name));
 		log("HierFuzz %s coverage: %s (no clock or no coverage bits, zero outputs)\n",
 		    version_tag, module->name.c_str());
@@ -2188,6 +2260,34 @@ static void hierfuzz_coverage_module_v9_v6b(
 	}
 	module->connect(io_covsum, current_sum);
 	module->connect(io_covhash, covHash);
+
+	// v11 opt-in: io_hierCovSumTotal is an alias for the tree-summed io_hierCovSum.
+	// On the Yosys path io_hierCovSum is already aggregated above; v11/v12 emit
+	// the new port so HierRTLhostTotal (HIER_COV_TOTAL=1) routes on a stable name
+	// across the firrtl2 and Yosys paths.
+	if (emitSumTotal) {
+		RTLIL::Wire *io_sumtot = module->addWire(RTLIL::escape_id("io_hierCovSumTotal"), covSumSize);
+		io_sumtot->port_output = true;
+		module->connect(io_sumtot, current_sum);
+	}
+
+	// v12 opt-in: io_hierCovHashOwn = hashFn(inputBits ++ regBits, submodHashSize).
+	// No submod hashes, no bucket-histogram bits — a snapshot of this module's
+	// own state only. Parents read this instead of io_hierCovHash when they're
+	// also v12, breaking the transitive descendant-activity leak.
+	if (useOwnHashChain) {
+		std::vector<NamedBit> ownBits;
+		ownBits.insert(ownBits.end(), inputBits.begin(), inputBits.end());
+		ownBits.insert(ownBits.end(), regBits.begin(), regBits.end());
+		RTLIL::Wire *io_hashown = module->addWire(RTLIL::escape_id("io_hierCovHashOwn"), submodHashSize);
+		io_hashown->port_output = true;
+		if (ownBits.empty()) {
+			module->connect(io_hashown, RTLIL::Const(0, submodHashSize));
+		} else {
+			RTLIL::SigSpec ownHash = hashFn(module, ownBits, submodHashSize);
+			module->connect(io_hashown, ownHash);
+		}
+	}
 
 	module->fixup_ports();
 	module->set_bool_attribute(RTLIL::escape_id(attr_name));
@@ -2557,5 +2657,150 @@ struct HierFuzzInstrumentV9dPass : public Pass {
 			hierfuzz_reset_module(design, module, "hierfuzz_v9d_reset");
 	}
 } HierFuzzInstrumentV9dPass;
+
+// ---------------------------------------------------------------------------
+// V11a pass: v9a + tree-sum aggregation port (io_hierCovSumTotal alias).
+// ---------------------------------------------------------------------------
+struct HierFuzzInstrumentV11aPass : public Pass {
+	HierFuzzInstrumentV11aPass() : Pass("hierfuzz_instrument_v11a",
+		"instrument with hierCov v11a (v9a + io_hierCovSumTotal port)") { }
+	void help() override
+	{
+		log("\n");
+		log("    hierfuzz_instrument_v11a\n");
+		log("\n");
+		log("Hierarchical coverage v11a: same as v9a (direct concatenation /\n");
+		log("XOR-fold hash, submodHashSize=16, maxAddrWidth=20) but also emits a\n");
+		log("new output port `io_hierCovSumTotal` aliased to the tree-summed\n");
+		log("io_hierCovSum. Pair with HierRTLhostTotal (HIER_COV_TOTAL=1) so the\n");
+		log("harness routes on the new port name uniformly across firrtl2 and\n");
+		log("Yosys paths.\n");
+		log("\n");
+	}
+	void execute(std::vector<std::string>, RTLIL::Design *design) override
+	{
+		HierCovV9aParams p;
+		log("Executing HierFuzz v11a instrumentation.\n");
+
+		std::vector<RTLIL::Module *> modules;
+		for (auto module : design->selected_modules())
+			modules.push_back(module);
+
+		for (auto module : modules)
+			hierfuzz_coverage_module_v9_v6b(design, module,
+				p.maxInputHashSize, p.maxCoreHashSize, p.maxAddrWidth, p.submodHashSize,
+				p.covSumSize, p.maxInputPorts, p.maxBitsPerPort, p.maxRegBits, p.maxCtrlRegWidth,
+				p.bucketCount, p.bucketWidth, p.maxBucketSigBits,
+				build_direct_or_fold, "hierfuzz_v11a_cov", "v11a",
+				/*emitSumTotal=*/true, /*useOwnHashChain=*/false);
+		for (auto module : modules)
+			hierfuzz_assert_module(design, module, "hierfuzz_v11a_assert");
+		for (auto module : modules)
+			hierfuzz_reset_module(design, module, "hierfuzz_v11a_reset");
+	}
+} HierFuzzInstrumentV11aPass;
+
+// ---------------------------------------------------------------------------
+// V11b pass: v6b + tree-sum aggregation port.
+// ---------------------------------------------------------------------------
+struct HierFuzzInstrumentV11bPass : public Pass {
+	HierFuzzInstrumentV11bPass() : Pass("hierfuzz_instrument_v11b",
+		"instrument with hierCov v11b (v6b + io_hierCovSumTotal port)") { }
+	void help() override
+	{
+		log("\n");
+		log("    hierfuzz_instrument_v11b\n");
+		log("\n");
+		log("Hierarchical coverage v11b: same as v6b (bucket-XOR hash,\n");
+		log("submodHashSize=6) but also emits `io_hierCovSumTotal` aliased to\n");
+		log("the tree-summed io_hierCovSum. Pair with HierRTLhostTotal.\n");
+		log("\n");
+	}
+	void execute(std::vector<std::string>, RTLIL::Design *design) override
+	{
+		HierCovParams params;
+		log("Executing HierFuzz v11b instrumentation.\n");
+
+		for (auto module : design->selected_modules())
+			hierfuzz_coverage_module(design, module, params, CONTROL_INPUTS, "hierfuzz_v11b_cov",
+				/*emitSumTotal=*/true, /*useOwnHashChain=*/false);
+		for (auto module : design->selected_modules())
+			hierfuzz_assert_module(design, module, "hierfuzz_v11b_assert");
+		for (auto module : design->selected_modules())
+			hierfuzz_reset_module(design, module, "hierfuzz_v11b_reset");
+	}
+} HierFuzzInstrumentV11bPass;
+
+// ---------------------------------------------------------------------------
+// V12a pass: v11a + own-state hash addressing chain.
+// ---------------------------------------------------------------------------
+struct HierFuzzInstrumentV12aPass : public Pass {
+	HierFuzzInstrumentV12aPass() : Pass("hierfuzz_instrument_v12a",
+		"instrument with hierCov v12a (v11a + io_hierCovHashOwn chain)") { }
+	void help() override
+	{
+		log("\n");
+		log("    hierfuzz_instrument_v12a\n");
+		log("\n");
+		log("Hierarchical coverage v12a: v11a plus a new output port\n");
+		log("`io_hierCovHashOwn` (16-bit hash of own inputs + ctrl regs only).\n");
+		log("Parents read children's io_hierCovHashOwn instead of\n");
+		log("io_hierCovHash for the core hash portion of their bitmap address —\n");
+		log("removing the transitive descendant-activity leak that the\n");
+		log("bucket-histogram-driven io_hierCovHash carries.\n");
+		log("\n");
+	}
+	void execute(std::vector<std::string>, RTLIL::Design *design) override
+	{
+		HierCovV9aParams p;
+		log("Executing HierFuzz v12a instrumentation.\n");
+
+		std::vector<RTLIL::Module *> modules;
+		for (auto module : design->selected_modules())
+			modules.push_back(module);
+
+		for (auto module : modules)
+			hierfuzz_coverage_module_v9_v6b(design, module,
+				p.maxInputHashSize, p.maxCoreHashSize, p.maxAddrWidth, p.submodHashSize,
+				p.covSumSize, p.maxInputPorts, p.maxBitsPerPort, p.maxRegBits, p.maxCtrlRegWidth,
+				p.bucketCount, p.bucketWidth, p.maxBucketSigBits,
+				build_direct_or_fold, "hierfuzz_v12a_cov", "v12a",
+				/*emitSumTotal=*/true, /*useOwnHashChain=*/true);
+		for (auto module : modules)
+			hierfuzz_assert_module(design, module, "hierfuzz_v12a_assert");
+		for (auto module : modules)
+			hierfuzz_reset_module(design, module, "hierfuzz_v12a_reset");
+	}
+} HierFuzzInstrumentV12aPass;
+
+// ---------------------------------------------------------------------------
+// V12b pass: v11b + own-state hash addressing chain.
+// ---------------------------------------------------------------------------
+struct HierFuzzInstrumentV12bPass : public Pass {
+	HierFuzzInstrumentV12bPass() : Pass("hierfuzz_instrument_v12b",
+		"instrument with hierCov v12b (v11b + io_hierCovHashOwn chain)") { }
+	void help() override
+	{
+		log("\n");
+		log("    hierfuzz_instrument_v12b\n");
+		log("\n");
+		log("Hierarchical coverage v12b: v11b plus io_hierCovHashOwn chain.\n");
+		log("bucketHash counterpart to v12a.\n");
+		log("\n");
+	}
+	void execute(std::vector<std::string>, RTLIL::Design *design) override
+	{
+		HierCovParams params;
+		log("Executing HierFuzz v12b instrumentation.\n");
+
+		for (auto module : design->selected_modules())
+			hierfuzz_coverage_module(design, module, params, CONTROL_INPUTS, "hierfuzz_v12b_cov",
+				/*emitSumTotal=*/true, /*useOwnHashChain=*/true);
+		for (auto module : design->selected_modules())
+			hierfuzz_assert_module(design, module, "hierfuzz_v12b_assert");
+		for (auto module : design->selected_modules())
+			hierfuzz_reset_module(design, module, "hierfuzz_v12b_reset");
+	}
+} HierFuzzInstrumentV12bPass;
 
 PRIVATE_NAMESPACE_END
